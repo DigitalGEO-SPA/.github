@@ -1,0 +1,27 @@
+name: Falla
+description: Algo no funciona como debería
+labels: ["falla"]
+body:
+  - type: textarea
+    id: que-pasa
+    attributes:
+      label: Qué pasa
+      description: Comportamiento observado, con mensaje de error si lo hay.
+    validations:
+      required: true
+  - type: textarea
+    id: esperado
+    attributes:
+      label: Qué debería pasar
+    validations:
+      required: true
+  - type: textarea
+    id: pasos
+    attributes:
+      label: Pasos para reproducir
+      placeholder: "1. …\n2. …"
+  - type: input
+    id: entorno
+    attributes:
+      label: Entorno
+      placeholder: "Versión / commit, sistema operativo, Azure o local"

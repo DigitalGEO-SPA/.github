@@ -1,0 +1,20 @@
+name: Mejora
+description: Funcionalidad nueva o cambio de comportamiento
+labels: ["mejora"]
+body:
+  - type: textarea
+    id: necesidad
+    attributes:
+      label: Necesidad
+      description: Qué problema resuelve y para quién.
+    validations:
+      required: true
+  - type: textarea
+    id: propuesta
+    attributes:
+      label: Propuesta
+  - type: textarea
+    id: criterio
+    attributes:
+      label: Criterio de aceptación
+      description: Cómo sabremos que está terminado.

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Reportar una vulnerabilidad
+    url: https://github.com/DigitalGEO-SPA/.github/blob/main/SECURITY.md
+    about: No abras un issue público; sigue la política de seguridad.
+  - name: Contacto comercial
+    url: https://www.digitalgeo.cl
+    about: Cotizaciones y proyectos.
