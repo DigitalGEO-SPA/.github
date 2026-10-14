@@ -14,6 +14,8 @@ Formato: `AAAA-MM-DD <tema> — <resumen>`
 
 - Un commit por unidad de trabajo, con mensaje que explique el porqué si no es obvio.
 - Nunca commitear secretos ni datos de clientes (ver [SECURITY.md](SECURITY.md)).
+- Trabajo hecho con asistencia de IA: el commit lo declara con `Co-Authored-By` (transparencia).
+- Issues de repositorios externos se citan como texto ("MS-ZTA issue 1594"), no como `owner/repo#N`, para no generar referencias cruzadas automáticas.
 
 ## Versiones
 - Herramientas y productos usan [SemVer](https://semver.org/lang/es/): `vMAYOR.MENOR.PARCHE`, como tag de git sobre `main`.
