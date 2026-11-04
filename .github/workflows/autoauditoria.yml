@@ -1,0 +1,22 @@
+# El kit se audita con su propio flujo (llamada local, misma revisión del PR).
+name: autoauditoria
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autoauditoria-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  seguridad:
+    uses: ./.github/workflows/seguridad.yml
+    with:
+      umbral: alta
