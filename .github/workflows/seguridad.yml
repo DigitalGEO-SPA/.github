@@ -1,0 +1,532 @@
+# Flujo reutilizable de seguridad de la Fábrica DigitalGEO (puerta E5, kit S0).
+#
+# Escáneres deterministas que corren en cada PR y en cada push a main:
+#   - gitleaks: secretos en TODO el historial de git.
+#   - Semgrep CE: reglas OWASP + p/secrets (sin login, --metrics=off).
+#   - Dependencias vulnerables según el lenguaje detectado:
+#       .NET -> dotnet list package --vulnerable --include-transitive
+#       Python -> pip-audit
+#       Node -> npm audit --omit=dev
+#   - Trivy: vulnerabilidades del sistema de archivos y configuración de IaC/Dockerfile
+#     (Bicep se compila a ARM antes de escanear).
+#
+# Política: docs/seguridad/politica.md. Crítico/alto bloquea. El job «veredicto»
+# es el único check que se marca como obligatorio en la protección de rama.
+#
+# Reglas de cadena de suministro de este archivo:
+#   - Toda acción fijada por SHA de commit completo, con la versión en comentario.
+#   - Binarios descargados con versión fija y verificados por SHA-256 fijado aquí.
+#   - Ninguna entrada (inputs) se interpola directo en un script: pasa por env.
+#   - Sin pull_request_target. El token es de solo lectura.
+#   - Versiones elegidas con al menos ~2 semanas de publicadas (enfriamiento).
+#
+# Para subir los SARIF a Code Scanning se usa el flujo aparte seguridad-sarif.yml,
+# que es el único que pide security-events: write.
+
+name: seguridad
+
+on:
+  workflow_call:
+    inputs:
+      umbral:
+        description: "Severidad mínima que bloquea: critica | alta | media | baja. Por política no se sube sobre «alta»."
+        type: string
+        default: alta
+      gitleaks:
+        description: "Ejecutar gitleaks (historial completo)."
+        type: boolean
+        default: true
+      semgrep:
+        description: "Ejecutar Semgrep CE."
+        type: boolean
+        default: true
+      dependencias:
+        description: "Ejecutar auditoría de dependencias (.NET, Python, Node)."
+        type: boolean
+        default: true
+      trivy:
+        description: "Ejecutar Trivy fs (vulnerabilidades + configuración IaC/Dockerfile)."
+        type: boolean
+        default: true
+      semgrep-configs:
+        description: "Conjuntos de reglas de Semgrep, separados por espacio. Se pueden agregar rutas locales (p. ej. seguridad/semgrep/)."
+        type: string
+        default: "p/owasp-top-ten p/secrets"
+      pip-audit-ignorar:
+        description: "IDs de vulnerabilidad que pip-audit ignora (separados por espacio). Cada uno exige un riesgo aceptado con ADR vigente."
+        type: string
+        default: ""
+      dotnet-version:
+        description: "Versión del SDK .NET si el repo no trae global.json."
+        type: string
+        default: "8.0.x"
+      python-version:
+        description: "Versión de Python para pip-audit y Semgrep."
+        type: string
+        default: "3.12"
+      node-version:
+        description: "Versión de Node para npm audit."
+        type: string
+        default: "22"
+    outputs:
+      resultado:
+        description: "aprobado | bloqueado"
+        value: ${{ jobs.veredicto.outputs.resultado }}
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" # gitleaks_8.30.1_linux_x64.tar.gz
+  TRIVY_VERSION: "0.75.0"
+  TRIVY_SHA256: "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f" # trivy_0.75.0_Linux-64bit.tar.gz
+  SEMGREP_VERSION: "1.181.0"
+  PIP_AUDIT_VERSION: "2.10.1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  preparar:
+    name: preparar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      trivy-severidad: ${{ steps.umbral.outputs.trivy }}
+      semgrep-severidad: ${{ steps.umbral.outputs.semgrep }}
+      npm-nivel: ${{ steps.umbral.outputs.npm }}
+      dotnet-severidades: ${{ steps.umbral.outputs.dotnet }}
+      hay-dotnet: ${{ steps.lenguajes.outputs.dotnet }}
+      hay-python: ${{ steps.lenguajes.outputs.python }}
+      hay-node: ${{ steps.lenguajes.outputs.node }}
+    steps:
+      - name: Traducir umbral a cada herramienta (falla cerrada si el valor no es válido)
+        id: umbral
+        env:
+          UMBRAL: ${{ inputs.umbral }}
+        run: |
+          set -euo pipefail
+          echo "umbral recibido: '${UMBRAL}'"
+          case "${UMBRAL}" in
+            critica) trivy="CRITICAL";                    semgrep="ERROR";              npm="critical"; dotnet="Critical" ;;
+            alta)    trivy="CRITICAL,HIGH";               semgrep="ERROR";              npm="high";     dotnet="Critical,High" ;;
+            media)   trivy="CRITICAL,HIGH,MEDIUM";        semgrep="ERROR WARNING";      npm="moderate"; dotnet="Critical,High,Moderate" ;;
+            baja)    trivy="CRITICAL,HIGH,MEDIUM,LOW";    semgrep="ERROR WARNING INFO"; npm="low";      dotnet="Critical,High,Moderate,Low" ;;
+            *) echo "::error::umbral inválido '${UMBRAL}'. Valores: critica | alta | media | baja"; exit 1 ;;
+          esac
+          if [ "${UMBRAL}" = "critica" ]; then
+            echo "::warning::umbral 'critica' deja pasar hallazgos ALTOS. La política exige 'alta' o más estricto; requiere riesgo aceptado aprobado por Geovanni."
+          fi
+          {
+            echo "trivy=${trivy}"
+            echo "semgrep=${semgrep}"
+            echo "npm=${npm}"
+            echo "dotnet=${dotnet}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detectar lenguajes
+        id: lenguajes
+        run: |
+          set -euo pipefail
+          # Solo archivos versionados: evita node_modules, bin/ y obj/.
+          # grep -c sale con 1 cuando cuenta 0: «|| true» evita que set -e lo tome como error.
+          contar() { git ls-files -- "$@" | grep -c -v -E '(^|/)(node_modules|bin|obj)/' || true; }
+          n_dotnet=$(contar '*.sln' '*.slnx' '*.csproj' '*.fsproj' '*.vbproj')
+          n_python=$(contar '*requirements*.txt' '*pyproject.toml' '*Pipfile.lock' '*poetry.lock')
+          n_node=$(contar '*package.json')
+          echo "archivos .NET: ${n_dotnet} | Python: ${n_python} | Node: ${n_node}"
+          {
+            echo "dotnet=$([ "$n_dotnet" -gt 0 ] && echo true || echo false)"
+            echo "python=$([ "$n_python" -gt 0 ] && echo true || echo false)"
+            echo "node=$([ "$n_node" -gt 0 ] && echo true || echo false)"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  gitleaks:
+    name: gitleaks (historial completo)
+    if: inputs.gitleaks
+    needs: preparar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Instalar gitleaks (versión y SHA-256 fijos)
+        run: |
+          set -euo pipefail
+          archivo="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "${RUNNER_TEMP}/${archivo}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archivo}"
+          echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/${archivo}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xzf "${RUNNER_TEMP}/${archivo}" -C "${RUNNER_TEMP}/bin" gitleaks
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/bin/gitleaks" version
+
+      - name: Escanear historial
+        run: |
+          set -euo pipefail
+          echo "commits en el historial: $(git rev-list --all --count)"
+          # .gitleaks.toml y .gitleaksignore del repo se respetan si existen.
+          # Todo secreto bloquea, sin importar el umbral: se rota y después se limpia (SECURITY.md).
+          gitleaks git . --redact --verbose \
+            --report-format sarif --report-path gitleaks.sarif \
+            --exit-code 1
+
+      - name: Guardar SARIF
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-gitleaks
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+          retention-days: 30
+
+  semgrep:
+    name: semgrep CE
+    if: inputs.semgrep
+    needs: preparar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Instalar Semgrep (versión fija)
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-cache-dir "semgrep==${SEMGREP_VERSION}"
+          semgrep --version
+
+      - name: Escanear
+        env:
+          CONFIGS: ${{ inputs.semgrep-configs }}
+          SEVERIDADES: ${{ needs.preparar.outputs.semgrep-severidad }}
+          SEMGREP_SEND_METRICS: "off"
+          SEMGREP_ENABLE_VERSION_CHECK: "0"
+        run: |
+          set -euo pipefail
+          args=()
+          for c in ${CONFIGS}; do args+=(--config "$c"); done
+          for s in ${SEVERIDADES}; do args+=(--severity "$s"); done
+          echo "configs: ${CONFIGS}"
+          echo "severidades que bloquean: ${SEVERIDADES}"
+          # Sin login (no se usa SEMGREP_APP_TOKEN). --error: código 1 si hay hallazgos.
+          # Los falsos positivos se descartan con «nosemgrep: <regla> -- <motivo>» en la línea,
+          # y el motivo queda en el informe de triage (ver politica.md).
+          semgrep scan "${args[@]}" \
+            --metrics=off \
+            --error \
+            --sarif-output=semgrep.sarif \
+            --text
+
+      - name: Guardar SARIF
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-semgrep
+          path: semgrep.sarif
+          if-no-files-found: ignore
+          retention-days: 30
+
+  dependencias-dotnet:
+    name: dependencias .NET
+    if: inputs.dependencias && needs.preparar.outputs.hay-dotnet == 'true'
+    needs: preparar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ¿Hay global.json?
+        id: sdk
+        run: |
+          if [ -f global.json ]; then echo "global=true" | tee -a "$GITHUB_OUTPUT"; else echo "global=false" | tee -a "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        if: steps.sdk.outputs.global == 'true'
+        with:
+          global-json-file: global.json
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        if: steps.sdk.outputs.global != 'true'
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Restaurar y listar paquetes vulnerables (incluye transitivos)
+        env:
+          SEVERIDADES: ${{ needs.preparar.outputs.dotnet-severidades }}
+        run: |
+          set -euo pipefail
+          dotnet --version
+          # Objetivo: las soluciones; si no hay, cada proyecto.
+          mapfile -t objetivos < <(git ls-files -- '*.sln' '*.slnx')
+          if [ "${#objetivos[@]}" -eq 0 ]; then
+            mapfile -t objetivos < <(git ls-files -- '*.csproj' '*.fsproj' '*.vbproj')
+          fi
+          echo "objetivos: ${objetivos[*]}"
+          echo "severidades que bloquean: ${SEVERIDADES}"
+          mkdir -p "${RUNNER_TEMP}/dotnet"
+          i=0
+          for o in "${objetivos[@]}"; do
+            i=$((i+1))
+            echo "::group::${o}"
+            dotnet restore "$o"
+            dotnet list "$o" package --vulnerable --include-transitive
+            dotnet list "$o" package --vulnerable --include-transitive --format json > "${RUNNER_TEMP}/dotnet/r${i}.json"
+            echo "::endgroup::"
+          done
+          python3 - "${RUNNER_TEMP}/dotnet" <<'PY'
+          import json, os, pathlib, sys
+          bloquean = {s.strip().lower() for s in os.environ["SEVERIDADES"].split(",")}
+          bloqueos, total = [], 0
+          for f in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
+              datos = json.loads(f.read_text(encoding="utf-8-sig"))
+              for p in datos.get("projects", []):
+                  for fw in p.get("frameworks", []):
+                      for tipo in ("topLevelPackages", "transitivePackages"):
+                          for pkg in fw.get(tipo, []):
+                              for v in pkg.get("vulnerabilities", []):
+                                  total += 1
+                                  sev = v.get("severity", "?")
+                                  linea = f"{os.path.basename(p.get('path','?'))} [{fw.get('framework')}] {pkg['id']} {pkg.get('resolvedVersion')} -> {sev} {v.get('advisoryurl')}"
+                                  print(("BLOQUEA  " if sev.lower() in bloquean else "informa  ") + linea)
+                                  if sev.lower() in bloquean:
+                                      bloqueos.append(linea)
+          print(f"vulnerabilidades: {total} | bloquean: {len(bloqueos)}")
+          if bloqueos:
+              print(f"::error::{len(bloqueos)} paquete(s) .NET vulnerables sobre el umbral")
+              sys.exit(1)
+          PY
+
+  dependencias-python:
+    name: dependencias Python
+    if: inputs.dependencias && needs.preparar.outputs.hay-python == 'true'
+    needs: preparar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Instalar pip-audit (versión fija)
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-cache-dir "pip-audit==${PIP_AUDIT_VERSION}"
+          pip-audit --version
+
+      - name: Auditar
+        env:
+          IGNORAR: ${{ inputs.pip-audit-ignorar }}
+        run: |
+          set -euo pipefail
+          # pip-audit no entrega severidad: toda vulnerabilidad conocida bloquea.
+          # Las excepciones van en «pip-audit-ignorar» con su ADR de riesgo aceptado.
+          ign=()
+          for id in ${IGNORAR}; do ign+=(--ignore-vuln "$id"); done
+          echo "ignoradas (con ADR): ${IGNORAR:-ninguna}"
+          fallas=0
+          mapfile -t reqs < <(git ls-files -- '*requirements*.txt' | grep -v -E '(^|/)(node_modules)/' || true)
+          mapfile -t proys < <(git ls-files -- '*pyproject.toml' | grep -v -E '(^|/)(node_modules)/' || true)
+          for r in "${reqs[@]}"; do
+            [ -n "$r" ] || continue
+            echo "::group::requirements: ${r}"
+            pip-audit --progress-spinner off --desc on "${ign[@]}" -r "$r" || fallas=$((fallas+1))
+            echo "::endgroup::"
+          done
+          for p in "${proys[@]}"; do
+            [ -n "$p" ] || continue
+            dir=$(dirname "$p")
+            # Si el proyecto ya tiene requirements en su carpeta, esos mandan.
+            # (solo la misma carpeta: el pathspec de git con * cruzaría subcarpetas)
+            if [ -n "$(find "$dir" -maxdepth 1 -name '*requirements*.txt' -print -quit)" ]; then continue; fi
+            echo "::group::proyecto: ${dir}"
+            pip-audit --progress-spinner off --desc on "${ign[@]}" "$dir" || fallas=$((fallas+1))
+            echo "::endgroup::"
+          done
+          echo "archivos con vulnerabilidades o error: ${fallas}"
+          [ "$fallas" -eq 0 ] || { echo "::error::pip-audit encontró vulnerabilidades (o no pudo resolver dependencias)"; exit 1; }
+
+  dependencias-node:
+    name: dependencias Node
+    if: inputs.dependencias && needs.preparar.outputs.hay-node == 'true'
+    needs: preparar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: npm audit --omit=dev
+        env:
+          NIVEL: ${{ needs.preparar.outputs.npm-nivel }}
+        run: |
+          set -euo pipefail
+          echo "nivel que bloquea: ${NIVEL}"
+          fallas=0
+          mapfile -t pkgs < <(git ls-files -- '*package.json' | grep -v -E '(^|/)node_modules/')
+          for p in "${pkgs[@]}"; do
+            dir=$(dirname "$p")
+            echo "::group::${dir}"
+            # Sin lockfile no hay versiones fijadas: es una desviación del kit y bloquea.
+            if [ ! -f "${dir}/package-lock.json" ] && [ ! -f "${dir}/npm-shrinkwrap.json" ]; then
+              echo "::error file=${p}::sin package-lock.json: versiones no fijadas (kit de código seguro)"
+              fallas=$((fallas+1)); echo "::endgroup::"; continue
+            fi
+            ( cd "$dir" && npm audit --omit=dev --audit-level="${NIVEL}" ) || fallas=$((fallas+1))
+            echo "::endgroup::"
+          done
+          echo "paquetes con fallas: ${fallas}"
+          [ "$fallas" -eq 0 ] || { echo "::error::npm audit sobre el umbral"; exit 1; }
+
+  trivy:
+    name: trivy (fs + IaC)
+    if: inputs.trivy
+    needs: preparar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar Trivy (versión y SHA-256 fijos)
+        run: |
+          set -euo pipefail
+          archivo="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL -o "${RUNNER_TEMP}/${archivo}" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${archivo}"
+          echo "${TRIVY_SHA256}  ${RUNNER_TEMP}/${archivo}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xzf "${RUNNER_TEMP}/${archivo}" -C "${RUNNER_TEMP}/bin" trivy
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/bin/trivy" --version
+
+      - name: Compilar Bicep a ARM (Trivy no lee Bicep)
+        run: |
+          set -euo pipefail
+          mapfile -t bicep < <(git ls-files -- '*.bicep')
+          echo "archivos Bicep: ${#bicep[@]}"
+          [ "${#bicep[@]}" -gt 0 ] || exit 0
+          az bicep install
+          mkdir -p .trivy-arm
+          for b in "${bicep[@]}"; do
+            destino=".trivy-arm/$(dirname "$b")"
+            mkdir -p "$destino"
+            az bicep build --file "$b" --outdir "$destino"
+          done
+          find .trivy-arm -name '*.json' -print
+
+      - name: Escanear (bloquea según umbral)
+        env:
+          SEVERIDAD: ${{ needs.preparar.outputs.trivy-severidad }}
+        run: |
+          set -euo pipefail
+          echo "severidades que bloquean: ${SEVERIDAD}"
+          # .trivyignore del repo se respeta si existe (cada entrada con su ADR).
+          trivy fs . \
+            --scanners vuln,misconfig \
+            --severity "${SEVERIDAD}" \
+            --skip-dirs node_modules \
+            --format table \
+            --exit-code 1
+
+      - name: SARIF (todas las severidades, para Code Scanning)
+        if: always()
+        run: |
+          set -euo pipefail
+          trivy fs . --scanners vuln,misconfig --skip-dirs node_modules \
+            --format sarif --output trivy.sarif --exit-code 0 || true
+
+      - name: Guardar SARIF
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-trivy
+          path: trivy.sarif
+          if-no-files-found: ignore
+          retention-days: 30
+
+  veredicto:
+    name: veredicto
+    if: always()
+    needs: [preparar, gitleaks, semgrep, dependencias-dotnet, dependencias-python, dependencias-node, trivy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      resultado: ${{ steps.v.outputs.resultado }}
+    steps:
+      - name: Consolidar (falla cerrada)
+        id: v
+        env:
+          RESULTADOS: ${{ toJSON(needs) }}
+          GITLEAKS: ${{ inputs.gitleaks }}
+          SEMGREP: ${{ inputs.semgrep }}
+          DEPENDENCIAS: ${{ inputs.dependencias }}
+          TRIVY: ${{ inputs.trivy }}
+        run: |
+          set -euo pipefail
+          echo "escáneres activos: gitleaks=${GITLEAKS} semgrep=${SEMGREP} dependencias=${DEPENDENCIAS} trivy=${TRIVY}"
+          [ "${GITLEAKS}" = "true" ] || echo "::warning::gitleaks DESACTIVADO: requiere riesgo aceptado aprobado por Geovanni"
+          [ "${SEMGREP}" = "true" ] || echo "::warning::Semgrep DESACTIVADO: requiere riesgo aceptado aprobado por Geovanni"
+          [ "${DEPENDENCIAS}" = "true" ] || echo "::warning::auditoría de dependencias DESACTIVADA: requiere riesgo aceptado aprobado por Geovanni"
+          [ "${TRIVY}" = "true" ] || echo "::warning::Trivy DESACTIVADO: requiere riesgo aceptado aprobado por Geovanni"
+          python3 - <<'PY'
+          import json, os
+          needs = json.loads(os.environ["RESULTADOS"])
+          malos = []
+          for job, d in needs.items():
+              r = d.get("result")
+              print(f"{job:22s} {r}")
+              # success y skipped (escáner desactivado o lenguaje ausente) pasan.
+              # failure, cancelled o cualquier otro estado bloquean.
+              if r not in ("success", "skipped"):
+                  malos.append(job)
+          if needs.get("preparar", {}).get("result") != "success":
+              malos.append("preparar (obligatorio)")
+          resultado = "bloqueado" if malos else "aprobado"
+          print(f"resultado: {resultado}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"resultado={resultado}\n")
+          if malos:
+              print(f"::error::bloqueado por: {', '.join(sorted(set(malos)))}. Ver docs/seguridad/politica.md")
+              raise SystemExit(1)
+          PY

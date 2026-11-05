@@ -1,0 +1,58 @@
+# Subida opcional de los SARIF de seguridad.yml a Code Scanning.
+#
+# Va en un flujo aparte porque es el ÚNICO que necesita security-events: write.
+# Si estuviera dentro de seguridad.yml, todo repo que lo llame tendría que conceder
+# ese permiso aunque no suba nada (un job anidado no puede pedir más permisos que
+# los que concede el llamador). Así, el que no sube SARIF se queda con contents: read.
+#
+# Requisito: Code Scanning disponible (repo público, o GitHub Advanced Security
+# en repos privados). Ver docs/seguridad/uso-workflow.md.
+
+name: seguridad-sarif
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  subir:
+    name: subir SARIF
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        escaner: [gitleaks, semgrep, trivy]
+    steps:
+      - name: Descargar SARIF de ${{ matrix.escaner }}
+        id: bajar
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sarif-${{ matrix.escaner }}
+          path: sarif
+
+      - name: ¿Hay archivo?
+        id: hay
+        env:
+          ESCANER: ${{ matrix.escaner }}
+        run: |
+          if ls sarif/*.sarif >/dev/null 2>&1; then
+            echo "SARIF de ${ESCANER}: $(ls sarif/*.sarif)"
+            echo "si=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sin SARIF de ${ESCANER} (escáner desactivado u omitido)"
+            echo "si=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Subir a Code Scanning
+        if: steps.hay.outputs.si == 'true'
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: sarif
+          category: seguridad-${{ matrix.escaner }}

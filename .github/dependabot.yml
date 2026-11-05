@@ -1,0 +1,13 @@
+# Propone actualizaciones de SHA de las acciones fijadas en los flujos.
+# Los binarios (gitleaks, Trivy) y los paquetes PyPI (Semgrep, pip-audit) del
+# flujo de seguridad se actualizan a mano: versión + SHA-256 en el mismo PR.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: "dependabot"
